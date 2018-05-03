@@ -7,3 +7,7 @@ ProblemFilters.exclude[DirectMissingMethodProblem]("akka.http.javadsl.ConnectHtt
 # Constructor @InternalApi class:
 ProblemFilters.exclude[DirectMissingMethodProblem]("akka.http.javadsl.ConnectHttpsImpl.this")
 
+# #427 h2c via 'Upgrade'
+ProblemFilters.exclude[MissingClassProblem]("akka.http.impl.engine.*")
+ProblemFilters.exclude[MissingTypesProblem]("akka.http.impl.engine.*")
+ProblemFilters.exclude[DirectMissingMethodProblem]("akka.http.impl.engine.*")
