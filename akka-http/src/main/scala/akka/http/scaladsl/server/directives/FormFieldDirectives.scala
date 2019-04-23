@@ -107,7 +107,7 @@ object FormFieldDirectives extends FormFieldDirectives {
     }.flatMap { sequenceF =>
       onComplete(sequenceF).flatMap {
         case Success(x)                                  => provide(x)
-        case Failure(x: UnsupportedContentTypeException) => reject(UnsupportedRequestContentTypeRejection(x.supported))
+        case Failure(x: UnsupportedContentTypeException) => reject(UnsupportedRequestContentTypeRejection(x.supported, x.actualContentType))
         case Failure(x: EntityStreamSizeException)       => reject(MalformedRequestContentRejection(x.getMessage.nullAsEmpty, x))
         case Failure(_)                                  => reject // TODO Use correct rejections
       }
@@ -183,7 +183,7 @@ object FormFieldDirectives extends FormFieldDirectives {
     protected def handleFieldResult[T](fieldName: String, result: Future[T]): Directive1[T] = onComplete(result).flatMap {
       case Success(x)                                  => provide(x)
       case Failure(Unmarshaller.NoContentException)    => reject(MissingFormFieldRejection(fieldName))
-      case Failure(x: UnsupportedContentTypeException) => reject(UnsupportedRequestContentTypeRejection(x.supported))
+      case Failure(x: UnsupportedContentTypeException) => reject(UnsupportedRequestContentTypeRejection(x.supported, x.actualContentType))
       case Failure(x)                                  => reject(MalformedFormFieldRejection(fieldName, x.getMessage.nullAsEmpty, Option(x.getCause)))
     }
 
