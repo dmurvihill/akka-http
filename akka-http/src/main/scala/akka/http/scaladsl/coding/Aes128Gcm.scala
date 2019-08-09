@@ -21,31 +21,46 @@ import javax.crypto.{ AEADBadTagException, Cipher, Mac, SecretKey }
   * Reference: RFC 8188
   *
   * WARNING: Use of Akka HTTP's default message filter is not
-  * recommended, since
-  * that filter only encodes successful responses; if you do use the
-  * default message filter, be aware that any error responses you send
-  * back will not be encrypted.
+  * recommended, since that filter only encodes successful responses; if
+  * you do use the default message filter, be aware that any error
+  * responses you send back will not be encrypted.
   *
   * WARNING: NEVER OVERRIDE THE "saltOverride" PARAMETER IN PRODUCTION.
-  *
   * If the same salt is ever reused for _any_ message, the encryption
   * key can be trivially recovered. The 'saltOverride' parameter is
   * intended for verifying the cipher against published test vectors
   * _only_.
+  *
+  * This implementation has some undesired behavior due to limitations
+  * in the [[ByteStringParser]] class. In order to properly emit the
+  * final record, the encoding class needs to have an opportunity to
+  * save the last N bytes of the input and process it only when the
+  * input stream is closed. In other words, the validity of the present
+  * input depends on the content of later inputs.
+  *
+  * My theory is a little rusty, but I believe the problem is that
+  * ByteStringParser recognizes only context-free languages whereas the
+  * aes128gcm encoding is a context-sensitive language due to the
+  * variable length and different padding delimiter of its final record.
+  *
+  * As a workaround, we are going to assume that parse() will only be
+  * called while a complete record is available. This is a very bad
+  * assumption and probably shouldn't make it to production, but it will
+  * at least serve to start the discussion about how to support this
+  * encoding.
  */
 class Aes128GcmEncoding(
   override val messageFilter: HttpMessage => Boolean,
   encodingKey:                Array[Byte],
   encodingKeyId:              String,
   getDecodingKey:             String => IndexedSeq[Byte],
-  saltOverride: Option[IndexedSeq[Byte]] = None,
 ) extends Coder with StreamDecoder {
 
   override def encoding: HttpEncoding = HttpEncoding.custom("aes128gcm")
 
   override def newCompressor: Compressor = {
     new Aes128GcmEncoder(encodingKey, encodingKeyId,
-      Aes128GcmEncoding.defaultRecordSize, saltOverride)
+      Aes128GcmEncoding.defaultRecordSize)
   }
 
   override def newDecompressorStage(maxBytesPerChunk: Int): () => Aes128GcmDecoder =
@@ -73,7 +88,7 @@ case class GcmParams(key: IndexedSeq[Byte], salt: IndexedSeq[Byte], recordSize: 
   require(
     recordSize <= maxRecordSize,
     s"record size $recordSize exceeds the max record size ($maxRecordSize)")
-  def maxRecordPlaintextLength: Long =
+  def inputRecordSize: Long =
     recordSize - Aes128GcmEncoding.authTagLength - Aes128GcmEncoding.minRecordPad
 }
 
@@ -121,12 +136,12 @@ class Aes128GcmDecoder(
     }
 
     case class Decrypt(state: GcmState) extends ParseStep[ByteString] {
-      override def canWorkWithPartialData: Boolean = false
+      override def canWorkWithPartialData: Boolean = true
       override def onTruncation(): Unit = throw new IllegalStateException("Truncated aes128gcm stream")
 
       /** Decrypt the next record */
       override def parse(reader: ByteReader): ParseResult[ByteString] = {
-        val encryptedRecord: ByteString = takeLong(reader, state.params.recordSize)
+        val encryptedRecord: ByteString = takeLong(reader, Math.min(reader.remainingSize, state.params.recordSize))
         val nonce = deriveNonce(state.firstIv, state.seqNo)
         val padded = aes128Decode(encryptedRecord.toArray, state.contentEncryptionKey, nonce)
         val paddingDelimiterIndex = padded.lastIndexWhere(_ != 0x00)
@@ -170,6 +185,21 @@ class Aes128GcmDecoder(
   * key can be trivially recovered. The 'saltOverride' parameter is
   * intended for verifying the cipher against published test vectors
   * _only_.
+  *
+  * It's usually best not to call flush() in the middle of a record. The
+  * record will be padded to the full record size, which is a waste of
+  * bandwidth. Instead, flush after writing a number of bytes equal to a
+  * multiple of the input record size. The input record size is always
+  * 17 bytes less than the output record size (to allow for a 16-byte
+  * AEAD tag in the output ciphertext and a 1-byte padding delimiter in
+  * the output plaintext)
+  *
+  * @param key Input Keying Material for the cipher
+  * @param keyId Identifier for the message recipient to use to look up
+  *              the key
+  * @param recordSize Output record size for the encoding
+  * @param saltOverride Salt to encode with. Never reuse! If you do, the
+  *                     encryption key will be trivially recoverable.
   */
 class Aes128GcmEncoder(key: IndexedSeq[Byte],
                        keyId: String,
@@ -193,45 +223,53 @@ class Aes128GcmEncoder(key: IndexedSeq[Byte],
   override def compress(input: ByteString): ByteString = {
     ensureOpen()
     inputBuffer = inputBuffer ++ input
-    val recordsOut = if (input.length >= params.maxRecordPlaintextLength)
-      encryptRecord(takeLong(params.maxRecordPlaintextLength)) ++ compress(ByteString())
-    else ByteString()
-    state = state.copy(seqNo = state.seqNo + 1)
+    val recordsOut = {
+      if (inputBuffer.length >= params.inputRecordSize) {
+        val thisRecord = encrypt(pad(takeLong(params.inputRecordSize), params.inputRecordSize + 1))
+        thisRecord ++ compress(ByteString())
+      } else if (inputBuffer.nonEmpty) {
+        // HACK: assume any compress() of incomplete records is the
+        // final record.
+        this.finish()
+      }
+      else ByteString()
+    }
     emitHeaderIfNeeded() ++ recordsOut
   }
 
   override def flush(): ByteString = {
     ensureOpen()
-    require(inputBuffer.isEmpty, "Cannot flush in the middle of a record." +
-      "If this is the last record, call finish() intsead.")
-    emitHeaderIfNeeded()
+    val recordOut = if (inputBuffer.nonEmpty)
+      encrypt(pad(takeLong(inputBuffer.length), params.inputRecordSize + 1))
+      else ByteString()
+    emitHeaderIfNeeded() ++ recordOut
   }
 
   override def finish(): ByteString = {
-    ensureOpen()
+//    ensureOpen()  HACK: Tolerate double finishes to accommodate the hack in compress()
     isFinished = true
-    // TODO this can cause us to have empty records and that's not efficient.
-    // Maybe we can somehow LBYL to see which record is the last.
-    emitHeaderIfNeeded() ++ encryptRecord(inputBuffer)
+    val len = inputBuffer.length
+    val recordOut = if (inputBuffer.nonEmpty)
+      encrypt(pad(takeLong(len), len + 1))
+      else ByteString()
+    emitHeaderIfNeeded() ++ recordOut
   }
 
-  private def encryptRecord(raw: ByteString): ByteString = {
-    assert(raw.length <= params.maxRecordPlaintextLength)
+  private def encrypt(raw: ByteString): ByteString = {
+    assert(raw.length <= params.inputRecordSize)
     // Only the final record can be smaller than the record size
-    assert(raw.length == params.maxRecordPlaintextLength || isFinished)
-    val toLength = params.recordSize - Aes128GcmEncoding.authTagLength
-    assert(toLength < Int.MaxValue) // required by pad()
-    val padded = pad(raw, toLength)
+    assert(raw.length == params.inputRecordSize || isFinished)
     val nonce = deriveNonce(state.firstIv, state.seqNo)
-    ByteString(aes128Encode(padded, state.contentEncryptionKey, nonce))
+    state = state.copy(seqNo = state.seqNo + 1)
+    ByteString(aes128Encode(raw.toArray, state.contentEncryptionKey, nonce))
   }
 
-  private def pad(plain: IndexedSeq[Byte], toLength: Long): Array[Byte] = {
+  private def pad(plain: IndexedSeq[Byte], toLength: Long): ByteString = {
     assert(toLength < Int.MaxValue) // Array.length is an Int
     assert(plain.length < toLength)
     val toLengthInt = toLength.toInt
     val padded = new Array[Byte](toLengthInt)
-    val delimIndex = toLengthInt - (toLengthInt - plain.length)
+    val delimIndex = plain.length
     for (i <- 0 until delimIndex) {
       padded(i) = plain(i)
     }
@@ -239,7 +277,7 @@ class Aes128GcmEncoder(key: IndexedSeq[Byte],
     for (i <- delimIndex + 1 until toLengthInt) {
       padded(i) = 0x00.toByte
     }
-    padded
+    ByteString(padded)
   }
 
   override def compressAndFlush(input: ByteString): ByteString = compress(input) ++ flush()
@@ -278,6 +316,7 @@ class Aes128GcmEncoder(key: IndexedSeq[Byte],
     outBuffer.put(toUint32ByteArray(params.recordSize, outBuffer.order))
     outBuffer.put(toUint8ByteArray(keyIdBytes.length.toShort))
     outBuffer.put(keyIdBytes)
+    outBuffer.rewind()
     ByteString(outBuffer)
   }
 
@@ -387,6 +426,7 @@ object KeyIdEncoding extends ByteRepresentationsUtil {
     } else if (result1.isUnmappable || result2.isUnmappable) {
       InvalidKeyId(s"key ID ${toHexString(encoded)} contains unmappable code points; should be valid UTF-8")
     } else {
+      buf.rewind()
       ValidKeyId(buf.toString)
     }
     utf8Decoder.reset()

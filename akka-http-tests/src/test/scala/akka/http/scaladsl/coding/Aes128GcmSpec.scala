@@ -1,9 +1,12 @@
 package akka.http.scaladsl.coding
 
-import java.io.{ FilterOutputStream, InputStream, OutputStream }
+import scala.concurrent.duration._
+import java.io.{FilterOutputStream, InputStream, OutputStream}
 import java.nio.charset.StandardCharsets
 import java.security.SecureRandom
 import java.util.Base64
+import akka.http.impl.util._
+import akka.testkit._
 
 import akka.stream.scaladsl.StreamConverters
 import akka.util.ByteString
@@ -18,7 +21,8 @@ import akka.util.ByteString
  * validate that the implementation is internally consistent, not that
  * it is correct.
  *
- * The two test vectors are provided in RFC8188 are tested here. (TODO)
+ * To test correctness, the two test vectors are provided in RFC8188 are
+ * checked here.
  */
 class Aes128GcmSpec extends CoderSpec with GcmEncodingCryptoPrimitives {
   private val rand = new SecureRandom()
@@ -43,14 +47,54 @@ class Aes128GcmSpec extends CoderSpec with GcmEncodingCryptoPrimitives {
     new AesOutputStream(underlying, new Aes128GcmEncoder(encryptionKey, keyId))
 
   override def extraTests(): Unit = {
-    "correctly encode the example in RFC 8188 section 3.1" in {
+
+    /* RFC 8188 Section 3.1 */
+    "properly encode the test response body from the spec" in {
+      val message = ByteString(StandardCharsets.UTF_8.encode("I am the walrus"))
       val key = Base64.getUrlDecoder.decode("yqdlZ-tYemfogSmv7Ws5PQ")
-      new Aes128GcmEncoding(
-        _ => true,
-        key,
-        "",
-        _ => key
-      ).encode(ByteString(StandardCharsets.UTF_8.encode("I am the walrus")))
+      val keyId = ""
+      val salt: Array[Byte] = List(0x23, 0x50, 0x6c, 0xc6, 0xd1, 0x6d,
+        0xb6, 0x5b, 0xf7, 0xbb, 0xf3, 0xa8, 0xf7, 0x8c, 0x67, 0x9b)
+        .map(i => (i & 0xFF).toByte)
+        .toArray
+      val compressor = new Aes128GcmEncoder(key, keyId, 4096, Some(salt))
+      val expectedOutput = Base64.getUrlDecoder.decode(
+        "I1BsxtFttlv3u_Oo94xnmwAAEAAA-NAVub2qFgBEuQKRapoZu-IxkIva3MEB1PD-ly8Thjg"
+      )
+      val output = compressor.compressAndFinish(message)
+      output shouldBe expectedOutput
+    }
+
+    "properly decode the test response body from the spec" in {
+      val key = Base64.getUrlDecoder.decode("yqdlZ-tYemfogSmv7Ws5PQ")
+      val decoder = new Aes128GcmEncoding(_ => true, key, "", _ => key)
+      val ciphertext = ByteString(Base64.getUrlDecoder.decode(
+        "I1BsxtFttlv3u_Oo94xnmwAAEAAA-NAVub2qFgBEuQKRapoZu-IxkIva3MEB1PD-ly8Thjg"
+      ))
+      val decoded = decoder.decode(ciphertext)
+        .awaitResult(3.seconds.dilated)
+        .asByteBuffer
+      decoded shouldBe StandardCharsets.UTF_8.encode("I am the walrus")
+    }
+
+    "properly decode the multi-record response from the spec" in {
+      val key = Base64.getUrlDecoder.decode("BO3ZVPxUlnLORbVGMpbT1Q")
+      val decoder = new Aes128GcmEncoding(_ => true, key, "", _ => key)
+      val ciphertext = ByteString(Base64.getUrlDecoder.decode(
+        "uNCkWiNYzKTnBN9ji3-qWAAAABkCYTHOG8chz_gnvgOqdGYovxyjuqRyJFjEDyoF1Fvkj6hQPdPHI51OEUKEpgz3SsLWIqS_uA"
+      ))
+      val decoded = decoder.decode(ciphertext)
+        .awaitResult(3.seconds.dilated)
+        .asByteBuffer
+      decoded shouldBe StandardCharsets.UTF_8.encode("I am the walrus")
+    }
+
+    "pad the current record on flush()" in {
+      fail("Not implemented yet")
+    }
+
+    "Write the final record on finish()" in {
+      fail("Not implemented yet")
     }
   }
 
