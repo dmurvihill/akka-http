@@ -137,36 +137,70 @@ class Aes128GcmDecoder(
 
     case class Decrypt(state: GcmState) extends ParseStep[ByteString] {
       override def canWorkWithPartialData: Boolean = true
-      override def onTruncation(): Unit = throw new IllegalStateException("Truncated aes128gcm stream")
+
+      private val currentEncryptedRecord = ByteString()
+
+//      Proposed new implementation of onTruncation:
+//      override def onTruncation(remaining: ByteString): Option[ByteString] = {
+//        decryptRecord(remaining) match {
+//          case FinalRecord(plaintext) => Some(plaintext)
+//          case NonFinalRecord(_) =>
+//            throw new IllegalStateException(
+//              s"Truncated aes128gcm stream; expected last nonzero byte of " +
+//              s"final record to be 0x02, instead got 0x01.")
+//        }
+//      }
 
       /** Decrypt the next record */
-      override def parse(reader: ByteReader): ParseResult[ByteString] = {
-        val encryptedRecord: ByteString = takeLong(reader, Math.min(reader.remainingSize, state.params.recordSize))
-        val nonce = deriveNonce(state.firstIv, state.seqNo)
-        val padded = aes128Decode(encryptedRecord.toArray, state.contentEncryptionKey, nonce)
-        val paddingDelimiterIndex = padded.lastIndexWhere(_ != 0x00)
-        val decryptedRecord = ByteString.fromArray(padded.slice(0, paddingDelimiterIndex))
-        padded(paddingDelimiterIndex) match {
-          case 0x01 => ParseResult(
-            Some(decryptedRecord),
+      override def parse(reader: ByteReader): ParseResult[ByteString] =
+        decryptRecord(takeLong(reader, state.params.recordSize)) match {
+          case NonFinalRecord(plaintext) => ParseResult(
+            Some(plaintext),
             Decrypt(state.copy(seqNo = state.seqNo + 1)),
             acceptUpstreamFinish = false
           )
-          case 0x02 => ParseResult(Some(decryptedRecord), Finished)
+          case FinalRecord(plaintext) => ParseResult(
+            Some(plaintext),
+            FinishedParser,
+            acceptUpstreamFinish = true
+          )
+      }
+
+      private def decryptRecord(encryptedRecord: ByteString): Record = {
+        val nonce = deriveNonce(state.firstIv, state.seqNo)
+        val padded = aes128Decode(
+          encryptedRecord.toArray,
+          state.contentEncryptionKey,
+          nonce
+        )
+        val paddingDelimiterIndex = padded.lastIndexWhere(_ != 0x00)
+        val plaintext = ByteString.fromArray(
+          padded.slice(0,
+          paddingDelimiterIndex)
+        )
+        padded(paddingDelimiterIndex) match {
+          case 0x01 => NonFinalRecord(plaintext)
+          case 0x02 => FinalRecord(plaintext)
           case -1 =>
-            throw new IllegalArgumentException(s"Unable to decode request: record ${state.seqNo} is all zeroes")
+            throw new IllegalArgumentException(
+              s"Unable to decode request: record ${state.seqNo} is all " +
+              s"zeroes (length=${plaintext.length})"
+            )
           case _ =>
-            throw new IllegalArgumentException(s"Unable to decode request: record ${state.seqNo} has illegal " +
-              s"padding delimiter ${padded(paddingDelimiterIndex)} at offset $paddingDelimiterIndex. Should be 0x02 in " +
-              s"the last record, 0x01 in other records.")
+            throw new IllegalArgumentException(
+              s"Unable to decode request: record ${state.seqNo} has illegal " +
+              s"padding delimiter ${padded(paddingDelimiterIndex)} at offset " +
+              s"$paddingDelimiterIndex. Should be 0x02 in the last record, " +
+              s"0x01 in other records.")
         }
       }
 
-      case object Finished extends ParseStep[Nothing] {
-        override def parse(reader: ByteReader) =
-          throw new IllegalStateException("Received additional records after the final record.")
+      private sealed trait Record {
+        val content: ByteString
       }
-    }
+      private case class NonFinalRecord(content: ByteString) extends Record
+      private case class FinalRecord(content: ByteString) extends Record
+   }
 
     private def takeLong(reader: ByteReader, n: Long): ByteString = {
       if (n < Int.MaxValue) reader.take(n.toInt)
