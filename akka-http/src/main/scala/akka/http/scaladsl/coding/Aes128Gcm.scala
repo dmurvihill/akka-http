@@ -138,8 +138,6 @@ class Aes128GcmDecoder(
     case class Decrypt(state: GcmState) extends ParseStep[ByteString] {
       override def canWorkWithPartialData: Boolean = true
 
-      private val currentEncryptedRecord = ByteString()
-
 //      Proposed new implementation of onTruncation:
 //      override def onTruncation(remaining: ByteString): Option[ByteString] = {
 //        decryptRecord(remaining) match {
