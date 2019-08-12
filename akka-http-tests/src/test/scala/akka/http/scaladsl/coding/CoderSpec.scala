@@ -111,6 +111,8 @@ abstract class CoderSpec extends WordSpec with CodecSpecSupport with Inspectors 
       ourDecode(compressed) should equal(inputBytes)
     }
 
+    // NOTE: it's not possible for aes128gcm to comply with this because
+    // of the limit on record sizes.
     "shouldn't produce huge ByteStrings for some input" in {
       val array = new Array[Byte](100007)
       val random = ThreadLocalRandom.current()
