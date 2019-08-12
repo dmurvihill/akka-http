@@ -1,19 +1,19 @@
 package akka.http.scaladsl.coding
 
 import java.nio.charset.StandardCharsets
-import java.nio.{ ByteBuffer, ByteOrder, CharBuffer }
+import java.nio.{ByteBuffer, ByteOrder, CharBuffer}
 import java.security.SecureRandom
 
-import akka.http.scaladsl.coding.KeyIdEncoding.{ InvalidKeyId, ValidKeyId }
+import akka.http.scaladsl.coding.KeyIdEncoding.{InvalidKeyId, ValidKeyId}
 import akka.http.scaladsl.model.HttpMessage
 import akka.http.scaladsl.model.headers.HttpEncoding
 import akka.stream.Attributes
 import akka.stream.impl.io.ByteStringParser
-import akka.stream.impl.io.ByteStringParser.{ ByteReader, ParseResult, ParseStep }
+import akka.stream.impl.io.ByteStringParser.{ByteReader, FinishedParser, ParseResult, ParseStep}
 import akka.stream.stage.GraphStageLogic
 import akka.util.ByteString
-import javax.crypto.spec.{ GCMParameterSpec, SecretKeySpec }
-import javax.crypto.{ AEADBadTagException, Cipher, Mac, SecretKey }
+import javax.crypto.spec.{GCMParameterSpec, SecretKeySpec}
+import javax.crypto.{AEADBadTagException, Cipher, Mac, SecretKey}
 
 /**
   * Provides the aes128gcm content encoding
