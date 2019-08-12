@@ -4,12 +4,11 @@ import java.nio.charset.StandardCharsets
 import java.nio.{ByteBuffer, ByteOrder, CharBuffer}
 import java.security.SecureRandom
 
+import akka.http.scaladsl.coding.ByteStringParser.{ByteReader, FinishedParser, ParseResult, ParseStep}
 import akka.http.scaladsl.coding.KeyIdEncoding.{InvalidKeyId, ValidKeyId}
 import akka.http.scaladsl.model.HttpMessage
 import akka.http.scaladsl.model.headers.HttpEncoding
 import akka.stream.Attributes
-import akka.stream.impl.io.ByteStringParser
-import akka.stream.impl.io.ByteStringParser.{ByteReader, FinishedParser, ParseResult, ParseStep}
 import akka.stream.stage.GraphStageLogic
 import akka.util.ByteString
 import javax.crypto.spec.{GCMParameterSpec, SecretKeySpec}
@@ -90,6 +89,8 @@ case class GcmParams(key: IndexedSeq[Byte], salt: IndexedSeq[Byte], recordSize: 
     s"record size $recordSize exceeds the max record size ($maxRecordSize)")
   def inputRecordSize: Long =
     recordSize - Aes128GcmEncoding.authTagLength - Aes128GcmEncoding.minRecordPad
+  def paddedInputSize: Long =
+    inputRecordSize + Aes128GcmEncoding.minRecordPad
 }
 
 case class GcmState(params: GcmParams, contentEncryptionKey: SecretKey,
@@ -110,7 +111,8 @@ class Aes128GcmDecoder(
 
     case object ReadHeader extends ParseStep[ByteString] {
       override def canWorkWithPartialData: Boolean = false
-      override def onTruncation(): Unit = throw new IllegalStateException("Truncated aes128gcm stream")
+      override def onTruncation(rest: ByteString): Nothing =
+        throw new IllegalStateException("Truncated aes128gcm stream")
 
       override def parse(reader: ByteReader): ParseResult[ByteString] = {
         val salt = reader.take(16)
@@ -138,16 +140,15 @@ class Aes128GcmDecoder(
     case class Decrypt(state: GcmState) extends ParseStep[ByteString] {
       override def canWorkWithPartialData: Boolean = true
 
-//      Proposed new implementation of onTruncation:
-//      override def onTruncation(remaining: ByteString): Option[ByteString] = {
-//        decryptRecord(remaining) match {
-//          case FinalRecord(plaintext) => Some(plaintext)
-//          case NonFinalRecord(_) =>
-//            throw new IllegalStateException(
-//              s"Truncated aes128gcm stream; expected last nonzero byte of " +
-//              s"final record to be 0x02, instead got 0x01.")
-//        }
-//      }
+      override def onTruncation(remaining: ByteString): Some[ByteString] = {
+        decryptRecord(remaining) match {
+          case FinalRecord(plaintext) => Some(plaintext)
+          case NonFinalRecord(_) =>
+            throw new IllegalStateException(
+              s"Truncated aes128gcm stream; expected last nonzero byte of " +
+              s"final record to be 0x02, instead got 0x01.")
+        }
+      }
 
       /** Decrypt the next record */
       override def parse(reader: ByteReader): ParseResult[ByteString] =
@@ -159,8 +160,7 @@ class Aes128GcmDecoder(
           )
           case FinalRecord(plaintext) => ParseResult(
             Some(plaintext),
-            FinishedParser,
-            acceptUpstreamFinish = true
+            FinishedParser
           )
       }
 
@@ -255,42 +255,42 @@ class Aes128GcmEncoder(key: IndexedSeq[Byte],
   override def compress(input: ByteString): ByteString = {
     ensureOpen()
     inputBuffer = inputBuffer ++ input
+    val headerOut = emitHeaderIfNeeded()
     val recordsOut = {
       if (inputBuffer.length >= params.inputRecordSize) {
-        val thisRecord = encrypt(pad(takeLong(params.inputRecordSize), params.inputRecordSize + 1))
-        thisRecord ++ compress(ByteString())
-      } else if (inputBuffer.nonEmpty) {
-        // HACK: assume any compress() of incomplete records is the
-        // final record.
-        this.finish()
+        val input = takeLong(params.inputRecordSize)
+        val recordLength =
+          if (isFinished) input.length + Aes128GcmEncoding.minRecordPad
+          else params.paddedInputSize
+        encrypt(pad(input, recordLength)) ++ compress(ByteString())
       }
       else ByteString()
     }
-    emitHeaderIfNeeded() ++ recordsOut
+    headerOut ++ recordsOut
   }
 
   override def flush(): ByteString = {
     ensureOpen()
     val recordOut = if (inputBuffer.nonEmpty)
-      encrypt(pad(takeLong(inputBuffer.length), params.inputRecordSize + 1))
+      encrypt(pad(takeLong(inputBuffer.length), params.paddedInputSize))
       else ByteString()
     emitHeaderIfNeeded() ++ recordOut
   }
 
   override def finish(): ByteString = {
-//    ensureOpen()  HACK: Tolerate double finishes to accommodate the hack in compress()
-    isFinished = true
-    val len = inputBuffer.length
-    val recordOut = if (inputBuffer.nonEmpty)
-      encrypt(pad(takeLong(len), len + 1))
-      else ByteString()
-    emitHeaderIfNeeded() ++ recordOut
+    emitHeaderIfNeeded() ++ (
+      if (!isFinished) {
+        isFinished = true
+        val len = inputBuffer.length
+        encrypt(pad(takeLong(len), len + 1))
+      } else ByteString()
+    )
   }
 
   private def encrypt(raw: ByteString): ByteString = {
-    assert(raw.length <= params.inputRecordSize)
+    assert(raw.length <= params.paddedInputSize)
     // Only the final record can be smaller than the record size
-    assert(raw.length == params.inputRecordSize || isFinished)
+    assert(raw.length == params.paddedInputSize || isFinished)
     val nonce = deriveNonce(state.firstIv, state.seqNo)
     state = state.copy(seqNo = state.seqNo + 1)
     ByteString(aes128Encode(raw.toArray, state.contentEncryptionKey, nonce))
@@ -312,9 +312,11 @@ class Aes128GcmEncoder(key: IndexedSeq[Byte],
     ByteString(padded)
   }
 
-  override def compressAndFlush(input: ByteString): ByteString = compress(input) ++ flush()
+  override def compressAndFlush(input: ByteString): ByteString =
+    compress(input) ++ flush()
 
-  override def compressAndFinish(input: ByteString): ByteString = compress(input) ++ finish()
+  override def compressAndFinish(input: ByteString): ByteString =
+    compress(input) ++ finish()
 
   private def takeLong(n: Long): ByteString = {
     if (n == 0) ByteString.empty
