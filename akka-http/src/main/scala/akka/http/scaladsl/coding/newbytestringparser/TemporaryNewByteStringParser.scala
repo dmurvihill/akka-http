@@ -2,7 +2,7 @@
  * Copyright (C) 2015-2019 Lightbend Inc. <https://www.lightbend.com>
  */
 
-package akka.http.scaladsl.coding
+package akka.http.scaladsl.coding.newbytestringparser
 
 import akka.annotation.InternalApi
 import akka.stream._
@@ -10,7 +10,7 @@ import akka.stream.stage._
 import akka.util.ByteString
 
 import scala.annotation.tailrec
-import scala.util.control.{ NoStackTrace, NonFatal }
+import scala.util.control.{NoStackTrace, NonFatal}
 
 /**
   * INTERNAL API
@@ -26,7 +26,8 @@ import scala.util.control.{ NoStackTrace, NonFatal }
   final override val shape = FlowShape(bytesIn, objOut)
 
   class ParsingLogic extends GraphStageLogic(shape) with InHandler with OutHandler {
-    private var buffer = ByteString.empty
+    private var inBuffer = ByteString.empty
+    private var outBuffer: Stream[T] = Stream.empty
     private var current: ParseStep[T] = FinishedParser
     private var acceptUpstreamFinish: Boolean = true
     private var untilCompact = CompactionThreshold
@@ -36,33 +37,32 @@ import scala.util.control.{ NoStackTrace, NonFatal }
     protected def recursionLimit: Int = 1000
 
     /**
-      * doParse() is the main driver for the parser. It can be called from onPush, onPull and onUpstreamFinish.
-      * The general logic is that invocation of this method either results in an emitted parsed element, or an indication
-      * that there is more data needed.
-      *
-      * On completion there are various cases:
-      *  - buffer is empty: parser accepts completion or fails.
-      *  - buffer is non-empty, we wait for a pull. This might result in a few more onPull-push cycles, served from the
-      *    buffer. This can lead to two conditions:
-      *     - drained, empty buffer. This is either accepted completion (acceptUpstreamFinish) or a truncation.
-      *     - parser demands more data than in buffer. This is always a truncation.
-      *
-      * If the return value is true the method must be called another time to continue processing.
-      */
+     * doParse() is the main driver for the parser. It can be called from onPush, onPull and onUpstreamFinish.
+     * The general logic is that invocation of this method either results in an emitted parsed element, or an indication
+     * that there is more data needed.
+     *
+     * On completion there are various cases:
+     *  - input buffer is empty: parser accepts completion or fails.
+     *  - input buffer is non-empty, we wait for a pull. This might result in a few more onPull-push cycles, served from the
+     *    buffer. This can lead to two conditions:
+     *     - drained, empty input buffer. This is either accepted completion (acceptUpstreamFinish) or a truncation.
+     *     - parser demands more data than in buffer. This is always a truncation.
+     *
+     * If the return value is true the method must be called another time to continue processing.
+     */
     private def doParseInner(): Boolean =
-      if (buffer.nonEmpty) {
-        val reader = new ByteReader(buffer)
+      if (inBuffer.nonEmpty) {
+        val reader = new ByteReader(inBuffer)
         try {
           val parseResult = current.parse(reader)
           acceptUpstreamFinish = parseResult.acceptUpstreamFinish
-          parseResult.result.foreach(push(objOut, _))
+          outBuffer ++= parseResult.result
+          current = parseResult.nextStep
 
           if (parseResult.nextStep == FinishedParser) {
-            completeStage()
             DontRecurse
           } else {
-            buffer = reader.remainingData
-            current = parseResult.nextStep
+            inBuffer = reader.remainingData
 
             // If this step didn't produce a result, continue parsing.
             if (parseResult.result.isEmpty)
@@ -73,15 +73,10 @@ import scala.util.control.{ NoStackTrace, NonFatal }
         } catch {
           case NeedMoreData =>
             acceptUpstreamFinish = false
-            if (current.canWorkWithPartialData) buffer = reader.remainingData
+            if (current.canWorkWithPartialData) inBuffer = reader.remainingData
 
             // Not enough data in buffer and upstream is closed
-            if (isClosed(bytesIn)) {
-              current.onTruncation(buffer).foreach(push(objOut, _))
-              // If onTruncation returned without error, we assume the
-              // implementation was able to recover.
-              completeStage()
-            }
+            if (isClosed(bytesIn)) truncated()
             else pull(bytesIn)
 
             DontRecurse
@@ -94,12 +89,17 @@ import scala.util.control.{ NoStackTrace, NonFatal }
         if (isClosed(bytesIn)) {
           // Buffer is empty and upstream is done. If the current phase accepts completion we are done,
           // otherwise report truncation.
-          if (acceptUpstreamFinish) completeStage()
-          else current.onTruncation(buffer).foreach(push(objOut, _))
+          if (acceptUpstreamFinish) current = FinishedParser
+          else truncated()
         } else pull(bytesIn)
 
         DontRecurse
       }
+
+    private def truncated(): Unit = {
+      outBuffer ++= current.onTruncation(inBuffer)
+      current = FinishedParser
+    }
 
     @tailrec private def doParse(remainingRecursions: Int = recursionLimit): Unit =
       if (remainingRecursions == 0)
@@ -113,34 +113,50 @@ import scala.util.control.{ NoStackTrace, NonFatal }
         if (recurse) doParse(remainingRecursions - 1)
       }
 
-    // Completion is handled by doParse as the buffer either gets empty after this call, or the parser requests
+    private def nextStep(): Unit = {
+      if (outBuffer.nonEmpty) push()
+      else {
+        doParse()
+        if (outBuffer.nonEmpty) push()
+      }
+      if (outBuffer.isEmpty && current == FinishedParser) {
+        completeStage()
+      }
+    }
+
+    private def push(): Unit = {
+      push(objOut, outBuffer.head)
+      outBuffer = outBuffer.tail
+    }
+
+    // Completion is handled by nextStep as the input buffer either gets empty after this call, or the parser requests
     // data that we can no longer provide (truncation).
-    override def onPull(): Unit = doParse()
+    override def onPull(): Unit = nextStep()
 
     def onPush(): Unit = {
-      // Buffer management before we call doParse():
+      // Buffer management before we call nextStep():
       //  - append new bytes
-      //  - compact buffer if necessary
-      buffer ++= grab(bytesIn)
+      //  - compact input buffer if necessary
+      inBuffer ++= grab(bytesIn)
       untilCompact -= 1
       if (untilCompact == 0) {
         // Compaction prevents of ever growing tree (list) of ByteString if buffer contents overlap most of the
         // time and hence keep referring to old buffer ByteStrings. Compaction is performed only once in a while
         // to reduce cost of copy.
         untilCompact = CompactionThreshold
-        buffer = buffer.compact
+        inBuffer = inBuffer.compact
       }
-      doParse()
+      nextStep()
     }
 
     override def onUpstreamFinish(): Unit = {
       // If we have no a pending pull from downstream, attempt to invoke the parser again. This will handle
       // truncation if necessary, or complete the stage (and maybe a final emit).
-      if (isAvailable(objOut)) doParse()
+      if (isAvailable(objOut)) nextStep()
       // if we do not have a pending pull,
-      else if (buffer.isEmpty) {
-        if (acceptUpstreamFinish) completeStage()
-        else current.onTruncation(buffer).foreach(push(objOut, _))
+      else if (inBuffer.isEmpty) {
+        if (acceptUpstreamFinish) current = FinishedParser
+        else truncated()
       }
     }
 
@@ -166,7 +182,7 @@ import scala.util.control.{ NoStackTrace, NonFatal }
     * @param acceptUpstreamFinish - if true - stream will complete when received `onUpstreamFinish`, if "false"
     *                             - onTruncation will be called
     */
-  case class ParseResult[+T](result: Option[T], nextStep: ParseStep[T], acceptUpstreamFinish: Boolean = true)
+  case class ParseResult[+T](result: Traversable[T], nextStep: ParseStep[T], acceptUpstreamFinish: Boolean = true)
 
   trait ParseStep[+T] {
 
@@ -177,7 +193,12 @@ import scala.util.control.{ NoStackTrace, NonFatal }
     def canWorkWithPartialData: Boolean = false
     def parse(reader: ByteReader): ParseResult[T]
 
-    def onTruncation(remaining: ByteString): Option[T] =
+    /** Recover when the parser expects more data than is available.
+     *
+     * If this method returns, the parser will continue to emit the
+     * return values and then stop normally.
+     * */
+    def onTruncation(remaining: ByteString): Traversable[T] =
       throw new IllegalStateException("truncated data in ByteStringParser")
   }
 

@@ -123,7 +123,7 @@ abstract class CoderSpec extends WordSpec with CodecSpecSupport with Inspectors 
         Source.single(compressed)
           .via(Coder.withMaxBytesPerChunk(limit).decoderFlow)
           .runWith(Sink.seq)
-          .awaitResult(3.seconds.dilated)
+          .awaitResult(3000000.seconds.dilated)
 
       forAll(resultBs) { bs =>
         bs.length should be <= limit

@@ -4,8 +4,9 @@ import java.nio.charset.StandardCharsets
 import java.nio.{ByteBuffer, ByteOrder, CharBuffer}
 import java.security.SecureRandom
 
-import akka.http.scaladsl.coding.ByteStringParser.{ByteReader, FinishedParser, ParseResult, ParseStep}
+import akka.http.scaladsl.coding.newbytestringparser.ByteStringParser.{ByteReader, FinishedParser, ParseResult, ParseStep}
 import akka.http.scaladsl.coding.KeyIdEncoding.{InvalidKeyId, ValidKeyId}
+import akka.http.scaladsl.coding.newbytestringparser.ByteStringParser
 import akka.http.scaladsl.model.HttpMessage
 import akka.http.scaladsl.model.headers.HttpEncoding
 import akka.stream.Attributes
@@ -13,6 +14,8 @@ import akka.stream.stage.GraphStageLogic
 import akka.util.ByteString
 import javax.crypto.spec.{GCMParameterSpec, SecretKeySpec}
 import javax.crypto.{AEADBadTagException, Cipher, Mac, SecretKey}
+
+import scala.annotation.tailrec
 
 /**
   * Provides the aes128gcm content encoding
@@ -105,6 +108,8 @@ class Aes128GcmDecoder(
   maxBytesPerChunk: Int                        = Decoder.MaxBytesPerChunkDefault)
   extends ByteStringParser[ByteString] with GcmEncodingCryptoPrimitives {
 
+  private var outputBuffer = ByteString()
+
   override def initialAttributes: Attributes = Attributes.name("Aes128GcmDecoder")
 
   override def createLogic(attr: Attributes): GraphStageLogic = new ParsingLogic {
@@ -137,12 +142,12 @@ class Aes128GcmDecoder(
       }
     }
 
-    case class Decrypt(state: GcmState) extends ParseStep[ByteString] {
+    case class Decrypt(var state: GcmState) extends ParseStep[ByteString] {
       override def canWorkWithPartialData: Boolean = true
 
-      override def onTruncation(remaining: ByteString): Some[ByteString] = {
+      override def onTruncation(remaining: ByteString): Stream[ByteString] = {
         decryptRecord(remaining) match {
-          case FinalRecord(plaintext) => Some(plaintext)
+          case FinalRecord(plaintext) => streamChunks(outputBuffer ++ plaintext)
           case NonFinalRecord(_) =>
             throw new IllegalStateException(
               s"Truncated aes128gcm stream; expected last nonzero byte of " +
@@ -150,18 +155,21 @@ class Aes128GcmDecoder(
         }
       }
 
-      /** Decrypt the next record */
-      override def parse(reader: ByteReader): ParseResult[ByteString] =
-        decryptRecord(takeLong(reader, state.params.recordSize)) match {
-          case NonFinalRecord(plaintext) => ParseResult(
-            Some(plaintext),
-            Decrypt(state.copy(seqNo = state.seqNo + 1)),
-            acceptUpstreamFinish = false
-          )
-          case FinalRecord(plaintext) => ParseResult(
-            Some(plaintext),
-            FinishedParser
-          )
+      @tailrec
+      override final def parse(reader: ByteReader): ParseResult[ByteString] = {
+        if (outputBuffer.length >= maxBytesPerChunk || !reader.hasRemaining) {
+          // TODO fix bug where parse("") is called on a 0-record message; we end up with acceptUpstreamFinish = false even though the input is valid after the parse call
+          ParseResult(Some(takeOutputChunk()), this, acceptUpstreamFinish = false)
+        } else {
+          decryptRecord(takeLong(reader, state.params.recordSize)) match {
+            case NonFinalRecord(plaintext) =>
+              outputBuffer ++= plaintext
+              this.parse(reader)
+            case FinalRecord(plaintext) =>
+              outputBuffer ++= plaintext
+              DrainOutputBuffer().parse(reader)
+          }
+        }
       }
 
       private def decryptRecord(encryptedRecord: ByteString): Record = {
@@ -176,6 +184,7 @@ class Aes128GcmDecoder(
           padded.slice(0,
           paddingDelimiterIndex)
         )
+        state = state.copy(seqNo = state.seqNo + 1)
         padded(paddingDelimiterIndex) match {
           case 0x01 => NonFinalRecord(plaintext)
           case 0x02 => FinalRecord(plaintext)
@@ -200,9 +209,36 @@ class Aes128GcmDecoder(
       private case class FinalRecord(content: ByteString) extends Record
    }
 
+    case class DrainOutputBuffer() extends ParseStep[ByteString] {
+      override def canWorkWithPartialData: Boolean = true
+      override def parse(reader: ByteReader): ParseResult[ByteString] = {
+        if (reader.hasRemaining) {
+          throw new IllegalStateException("Unexpected trailing data after final record")
+        } else {
+          val out = takeOutputChunk()
+          val next = if (outputBuffer.nonEmpty) this else FinishedParser
+          ParseResult(Some(out), next)
+        }
+      }
+
+    }
+
     private def takeLong(reader: ByteReader, n: Long): ByteString = {
       if (n < Int.MaxValue) reader.take(n.toInt)
       else reader.take(Int.MaxValue) ++ takeLong(reader, n - Int.MaxValue)
+    }
+
+    private def takeOutputChunk(): ByteString = {
+      val size = Math.min(outputBuffer.length, maxBytesPerChunk)
+      val chunk = outputBuffer.take(size)
+      outputBuffer = outputBuffer.drop(size)
+      chunk
+    }
+
+    private def streamChunks(s: ByteString): Stream[ByteString] = {
+      val (head, tail) = s.splitAt(maxBytesPerChunk)
+      if (head.isEmpty) Stream.empty
+      else head #:: streamChunks(tail)
     }
 
     startWith(ReadHeader)

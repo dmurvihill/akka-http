@@ -71,14 +71,36 @@ class Aes128GcmSpec extends CoderSpec with GcmEncodingCryptoPrimitives {
     }
 
     "pad the current record on flush()" in {
-      fail("Not implemented yet")
+      val key = randByteArray(16)
+      val expLength =
+        Aes128GcmEncoding.headerLength(keyId.length.toByte) +
+          Aes128GcmEncoding.defaultRecordSize
+      new Aes128GcmEncoder(key, keyId)
+        .compressAndFlush(ByteString("I am the walrus"))
+        .length shouldBe expLength
     }
 
     "Write the final record on finish()" in {
-      fail("Not implemented yet")
+      val key = randByteArray(16)
+      val msg = "I am the walrus"
+      val expLength = Aes128GcmEncoding.headerLength(keyId.length.toByte) +
+        msg.length +
+        Aes128GcmEncoding.minRecordPad +
+        Aes128GcmEncoding.authTagLength
+      new Aes128GcmEncoder(key, keyId)
+        .compressAndFinish(ByteString(msg))
+        .length shouldBe expLength
     }
 
     "properly encode/decode with 32-bit record sizes" in {
+      fail("Not implemented yet")
+    }
+
+    "properly encode/decode with 8-bit key ID length" in {
+      fail("Not implemented yet")
+    }
+
+    "throw IllegalArgumentException when decoding a too-small record" in {
       fail("Not implemented yet")
     }
   }
